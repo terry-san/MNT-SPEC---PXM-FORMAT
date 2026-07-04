@@ -1,0 +1,6 @@
+{
+  "name": "Excel Column Realigner",
+  "description": "An Excel utility that parses, realigns, and merges columns from uploaded Excel files to match a custom Golden template, powered by AI semantic column matching.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
