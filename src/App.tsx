@@ -81,6 +81,13 @@ export default function App() {
   const [dragActive, setDragActive] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Fallback decision states
+  const [showFallbackModal, setShowFallbackModal] = useState(false);
+  const [pendingUploaded, setPendingUploaded] = useState<string[]>([]);
+  const [pendingGolden, setPendingGolden] = useState<string[]>([]);
+  const [partialMappings, setPartialMappings] = useState<{ [key: string]: string | null }>({});
+  const [partialSources, setPartialSources] = useState<{ [key: string]: "exact" | "ai" | "unmatched" | "manual" }>({});
+
   // --- Handlers ---
 
   // Load Preset
@@ -269,32 +276,63 @@ export default function App() {
         newSources[item.target] = item.matchType;
       }
 
-      setColumnMappings(newMappings);
-      setMappingSource(newSources);
-      showSuccess(`欄位自動分析完成！已為 ${uploaded.length} 個欄位找到最佳對應。`);
+      // Check if AI actually succeeded!
+      if (data.aiSuccess) {
+        setColumnMappings(newMappings);
+        setMappingSource(newSources);
+        showSuccess(`欄位自動分析完成！已為 ${uploaded.length} 個欄位找到最佳對應。`);
+      } else {
+        console.warn("AI mapping was unsuccessful, popping fallback decision modal to user.");
+        // AI was unsuccessful/unavailable, but we might have exact matches. Store partials and ask.
+        setPendingUploaded(uploaded);
+        setPendingGolden(golden);
+        setPartialMappings(newMappings);
+        setPartialSources(newSources);
+        setShowFallbackModal(true);
+      }
 
     } catch (apiErr) {
-      console.warn("Using client-side fuzzy similarity fallback match due to server error or offline mode.");
+      console.warn("API completely failed, prompting for client-side local fallback:", apiErr);
       
       const newMappings: { [key: string]: string | null } = {};
       const newSources: { [key: string]: "exact" | "ai" | "unmatched" | "manual" } = {};
 
+      // Match exact ones first locally
       for (const target of uploaded) {
         const normTarget = normalizeHeader(target);
-
-        // 1. Direct exact match
         const exactMatch = golden.find(g => normalizeHeader(g) === normTarget);
         if (exactMatch) {
           newMappings[target] = exactMatch;
           newSources[target] = "exact";
-          continue;
+        } else {
+          newMappings[target] = null;
+          newSources[target] = "unmatched";
         }
+      }
 
-        // 2. Fuzzy match
+      setPendingUploaded(uploaded);
+      setPendingGolden(golden);
+      setPartialMappings(newMappings);
+      setPartialSources(newSources);
+      setShowFallbackModal(true);
+    } finally {
+      setIsLoadingMapping(false);
+    }
+  };
+
+  // User confirmed to use local algorithm for fuzzy matching
+  const handleConfirmLocalFallback = () => {
+    const finalMappings = { ...partialMappings };
+    const finalSources = { ...partialSources };
+
+    for (const target of pendingUploaded) {
+      // If it doesn't have an exact match already, perform local fuzzy match
+      if (finalSources[target] !== "exact") {
+        const normTarget = normalizeHeader(target);
         let bestMatch: string | null = null;
         let highestSim = 0;
 
-        for (const g of golden) {
+        for (const g of pendingGolden) {
           const sim = getLevenshteinSimilarity(normTarget, normalizeHeader(g));
           if (sim > highestSim) {
             highestSim = sim;
@@ -302,22 +340,28 @@ export default function App() {
           }
         }
 
-        // Threshold of 0.4 similarity
         if (highestSim >= 0.4 && bestMatch) {
-          newMappings[target] = bestMatch;
-          newSources[target] = "ai";
+          finalMappings[target] = bestMatch;
+          finalSources[target] = "ai"; // Mark as matched (using "ai" as visual label for non-exact)
         } else {
-          newMappings[target] = null;
-          newSources[target] = "unmatched";
+          finalMappings[target] = null;
+          finalSources[target] = "unmatched";
         }
       }
-
-      setColumnMappings(newMappings);
-      setMappingSource(newSources);
-      showSuccess("已使用本地模糊匹配算法完成欄位對應！");
-    } finally {
-      setIsLoadingMapping(false);
     }
+
+    setColumnMappings(finalMappings);
+    setMappingSource(finalSources);
+    setShowFallbackModal(false);
+    showSuccess("已啟用本地模糊匹配算法完成欄位對應！");
+  };
+
+  // User declined local algorithm (keep only exact matches, others left unmatched)
+  const handleCancelLocalFallback = () => {
+    setColumnMappings(partialMappings);
+    setMappingSource(partialSources);
+    setShowFallbackModal(false);
+    showSuccess("已保留精確對應欄位，其餘請手動下拉對應。");
   };
 
   // Re-run matching if golden headers update
@@ -1225,6 +1269,76 @@ export default function App() {
 
               </div>
             </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Fallback Algorithm Decision Modal */}
+        <AnimatePresence>
+          {showFallbackModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+              {/* Backdrop */}
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                onClick={handleCancelLocalFallback}
+                className="fixed inset-0 bg-slate-950/50 backdrop-blur-sm"
+              />
+              
+              {/* Modal Card */}
+              <motion.div
+                initial={{ scale: 0.95, opacity: 0, y: 10 }}
+                animate={{ scale: 1, opacity: 1, y: 0 }}
+                exit={{ scale: 0.95, opacity: 0, y: 10 }}
+                transition={{ type: "spring", duration: 0.4 }}
+                className="relative bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md overflow-hidden z-10"
+              >
+                {/* Header Banner */}
+                <div className="bg-amber-50 p-6 border-b border-amber-100 flex items-start gap-4">
+                  <div className="p-3 bg-amber-100 text-amber-600 rounded-xl shrink-0">
+                    <AlertTriangle className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold text-slate-900">
+                      AI 語意比對無法使用
+                    </h3>
+                    <p className="text-xs text-amber-700 font-medium mt-1">
+                      (可能是 API 金鑰未設定或發生連線錯誤)
+                    </p>
+                  </div>
+                </div>
+
+                {/* Content */}
+                <div className="p-6 space-y-3">
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    系統目前無法連接至 AI 自動欄位對應服務。
+                  </p>
+                  <p className="text-sm text-slate-700 font-semibold leading-relaxed">
+                    您是否要使用「本地模糊比對算法」來自動進行欄位對應？
+                  </p>
+                  <div className="text-xs text-slate-500 bg-slate-50 p-3.5 rounded-xl border border-slate-200 leading-relaxed">
+                    💡 <b>本地算法說明：</b> 將根據字元相似度 (Levenshtein Distance) 自動比對。若選擇否，系統僅保留 100% 精確相符的欄位，其餘您可手動在下拉選單對應。
+                  </div>
+                </div>
+
+                {/* Footer Buttons */}
+                <div className="bg-slate-50 p-4 border-t border-slate-150 flex items-center justify-end gap-3">
+                  <button
+                    onClick={handleCancelLocalFallback}
+                    className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 border border-slate-300 rounded-lg transition-all"
+                  >
+                    否 (僅保留精確匹配)
+                  </button>
+                  <button
+                    onClick={handleConfirmLocalFallback}
+                    className="px-5 py-2 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 shadow-md shadow-blue-100 rounded-lg transition-all active:scale-95 flex items-center gap-1.5"
+                  >
+                    <Check className="w-4 h-4" />
+                    是 (使用本地算法)
+                  </button>
+                </div>
+              </motion.div>
+            </div>
           )}
         </AnimatePresence>
 
