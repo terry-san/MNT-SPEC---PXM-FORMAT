@@ -488,6 +488,84 @@ export default function App() {
         });
       }
 
+      // Add unmatched/unmapped original data rows at the end and style them red
+      const unmatchedHeaders = fileHeaders.filter(
+        fh => !columnMappings[fh] || !goldenHeaders.includes(columnMappings[fh] as string)
+      );
+      
+      if (unmatchedHeaders.length > 0) {
+        // Optional Divider Row
+        const dividerRow = worksheet.addRow({
+          golden: "--- 以下為上傳檔案中未對應之原始規格欄位 ---",
+          status: ""
+        });
+        dividerRow.height = 20;
+        dividerRow.eachCell((cell) => {
+          cell.font = { name: "Segoe UI", size: 9, bold: true, italic: true, color: { argb: "94A3B8" } };
+          cell.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: "F1F5F9" } // light gray bg for divider
+          };
+        });
+
+        for (let uIdx = 0; uIdx < unmatchedHeaders.length; uIdx++) {
+          const uHeader = unmatchedHeaders[uIdx];
+          const targetIdx = fileHeaders.indexOf(uHeader);
+
+          const rowData: any = {
+            golden: uHeader,
+            status: "(未對應原始欄位 - 已保留原始資料)"
+          };
+
+          for (let c = 0; c < fileRecords.length; c++) {
+            let cellValue = "";
+            if (targetIdx !== -1) {
+              const originalVal = fileRecords[c][targetIdx];
+              cellValue = originalVal !== undefined ? originalVal : "";
+            }
+            rowData[`record_${c}`] = cellValue;
+          }
+
+          const addedRow = worksheet.addRow(rowData);
+          addedRow.height = 24;
+
+          addedRow.eachCell((cell, colNumber) => {
+            cell.border = {
+              top: { style: "thin", color: { argb: "E2E8F0" } },
+              left: { style: "thin", color: { argb: "E2E8F0" } },
+              bottom: { style: "thin", color: { argb: "E2E8F0" } },
+              right: { style: "thin", color: { argb: "E2E8F0" } }
+            };
+
+            cell.alignment = { vertical: "middle", horizontal: "left" };
+
+            if (colNumber === 1) {
+              cell.font = { name: "Segoe UI", size: 10, bold: true, color: { argb: "DC2626" } };
+              cell.fill = {
+                type: "pattern",
+                pattern: "solid",
+                fgColor: { argb: "FEF2F2" } // Soft red bg
+              };
+            } else if (colNumber === 2) {
+              cell.font = { name: "Segoe UI", size: 10, bold: true, italic: true, color: { argb: "DC2626" } };
+              cell.fill = {
+                type: "pattern",
+                pattern: "solid",
+                fgColor: { argb: "FEF2F2" }
+              };
+            } else {
+              cell.font = { name: "Segoe UI", size: 10, color: { argb: "DC2626" } };
+              cell.fill = {
+                type: "pattern",
+                pattern: "solid",
+                fgColor: { argb: "FEF2F2" }
+              };
+            }
+          });
+        }
+      }
+
       // Generate buffer and trigger download
       const buffer = await workbook.xlsx.writeBuffer();
       const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });

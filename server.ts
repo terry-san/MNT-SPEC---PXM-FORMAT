@@ -124,11 +124,19 @@ async function startServer() {
       }
 
       // 2. AI matching for those that don't have an exact match
-      if (unmatchedTargets.length > 0 && process.env.GEMINI_API_KEY) {
+      const hasValidApiKey = process.env.GEMINI_API_KEY && 
+                             process.env.GEMINI_API_KEY.trim() !== "" && 
+                             process.env.GEMINI_API_KEY !== "undefined" && 
+                             process.env.GEMINI_API_KEY !== "null";
+
+      console.log(`[AI Match] Total uploaded: ${uploadedColumns.length}, exact matched: ${mappings.length}, unmatched remaining: ${unmatchedTargets.length}`);
+      console.log(`[AI Match] Valid API Key present: ${hasValidApiKey}`);
+
+      if (unmatchedTargets.length > 0 && hasValidApiKey) {
         try {
           const prompt = `
 You are an Excel spreadsheet column-matching assistant.
-We have a master list of "golden" column headers (these represent the desired template schema):
+We have a master list of "golden" column headers (desired template schema):
 ${JSON.stringify(goldenColumns)}
 
 We have some uploaded columns that do not have direct exact matches. Find the single closest semantic match for each from our golden list:
@@ -137,16 +145,22 @@ ${JSON.stringify(unmatchedTargets)}
 Rules:
 1. Align the uploaded target headers to the golden list of headers.
 2. Only match if there is a strong semantic similarity (e.g., "Regulatory Approvals" maps to "Regulatory", "Warranty period" maps to "Warranty", "Sync in" maps to "Sync Input", "Stand" maps to "Foot", "Speaker" maps to "Built-in Speakers").
-3. If an uploaded column has absolutely no relation or representation in the golden columns list, map it to null.
+3. If an uploaded column has absolutely no relation or representation in the golden columns list, map it to empty string "".
           `.trim();
 
-          // Retry logic up to 3 times with exponential backoff for resilience against 503 Service Unavailable
+          // Race the Gemini API call against a 5-second timeout to prevent hanging requests
+          const timeoutPromise = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("Gemini API call timed out (5s)")), 5000)
+          );
+
+          // Retry logic up to 2 times
           let response;
-          let retries = 3;
+          let retries = 2;
           let delay = 1000;
           for (let attempt = 1; attempt <= retries; attempt++) {
             try {
-              response = await ai.models.generateContent({
+              console.log(`[AI Match] Calling Gemini API (attempt ${attempt}/${retries})...`);
+              const apiCall = ai.models.generateContent({
                 model: "gemini-3.5-flash",
                 contents: prompt,
                 config: {
@@ -161,9 +175,9 @@ Rules:
                           type: Type.OBJECT,
                           properties: {
                             target: { type: Type.STRING, description: "The original unmatched target header" },
-                            golden: { type: Type.STRING, description: "The semantically matched golden header from the goldenColumns list, or null if no reasonable semantic match exists" }
+                            golden: { type: Type.STRING, description: "The semantically matched golden header from the goldenColumns list, or empty string if no reasonable semantic match exists" }
                           },
-                          required: ["target"]
+                          required: ["target", "golden"]
                         }
                       }
                     },
@@ -171,57 +185,47 @@ Rules:
                   }
                 }
               });
+
+              response = await Promise.race([apiCall, timeoutPromise]);
+              console.log("[AI Match] Gemini API response received successfully!");
               break; // Success, exit retry loop
             } catch (err: any) {
-              console.warn(`Gemini API call failed (attempt ${attempt}/${retries}):`, err.message || err);
+              console.warn(`[AI Match] Gemini API call failed (attempt ${attempt}/${retries}):`, err.message || err);
               if (attempt === retries) {
-                throw err; // Re-throw the error on final failure
+                throw err; // Re-throw the error on final failure to trigger fallback
               }
               await new Promise(resolve => setTimeout(resolve, delay));
-              delay *= 2;
+              delay *= 1.5;
             }
           }
 
           const resText = response?.text || "{}";
           const aiResult = JSON.parse(resText) as {
-            mappings?: Array<{ target: string; golden: string | null }>;
+            mappings?: Array<{ target: string; golden: string }>;
           };
 
           if (aiResult.mappings && Array.isArray(aiResult.mappings)) {
             for (const item of aiResult.mappings) {
-              const matchedGolden = item.golden && goldenColumns.includes(item.golden) ? item.golden : null;
+              const matchedGolden = item.golden && item.golden.trim() !== "" && goldenColumns.includes(item.golden) ? item.golden : null;
               mappings.push({
                 target: item.target,
                 golden: matchedGolden,
                 matchType: matchedGolden ? "ai" : "unmatched"
               });
             }
-          } else {
-            // Fallback: Use string distance matching for all unmatched targets
-            for (const target of unmatchedTargets) {
-              const fallbackGolden = findFallbackSemanticMatch(target, goldenColumns);
-              mappings.push({
-                target,
-                golden: fallbackGolden,
-                matchType: fallbackGolden ? "ai" : "unmatched"
-              });
-            }
           }
         } catch (aiError) {
-          console.error("Gemini API matching error:", aiError);
-          // Fallback if AI fails or key is missing
-          for (const target of unmatchedTargets) {
-            const fallbackGolden = findFallbackSemanticMatch(target, goldenColumns);
-            mappings.push({
-              target,
-              golden: fallbackGolden,
-              matchType: fallbackGolden ? "ai" : "unmatched"
-            });
-          }
+          console.error("[AI Match] Gemini API matching error, falling back to local fuzzy match:", aiError);
         }
-      } else if (unmatchedTargets.length > 0) {
-        // No API key, use fallback fuzzy matching instead of leaving everything blank
-        for (const target of unmatchedTargets) {
+      }
+
+      // Ensure every single unmatched target is mapped (fallback to local fuzzy matching if AI failed or didn't return some items)
+      const mappedTargets = new Set(mappings.map(m => m.target));
+      const remainingTargets = unmatchedTargets.filter(t => !mappedTargets.has(t));
+
+      if (remainingTargets.length > 0) {
+        console.log(`[AI Match] Running fallback matching for ${remainingTargets.length} columns.`);
+        for (const target of remainingTargets) {
           const fallbackGolden = findFallbackSemanticMatch(target, goldenColumns);
           mappings.push({
             target,
