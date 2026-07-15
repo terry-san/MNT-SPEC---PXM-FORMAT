@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import * as XLSX from "xlsx";
 import ExcelJS from "exceljs";
+import { GoogleGenAI, Type } from "@google/genai";
 import {
   Upload,
   Check,
@@ -245,6 +246,131 @@ export default function App() {
     reader.readAsArrayBuffer(file);
   };
 
+  // Run Column Alignment Matching via Browser-side Gemini API Client
+  const runClientSideSemanticMapping = async (uploaded: string[], golden: string[]): Promise<boolean> => {
+    const clientApiKey = (import.meta as any).env?.VITE_GEMINI_API_KEY;
+    if (!clientApiKey || clientApiKey.trim() === "" || clientApiKey === "undefined" || clientApiKey === "null") {
+      console.log("[Client AI Match] No client-side VITE_GEMINI_API_KEY configured.");
+      return false;
+    }
+
+    try {
+      console.log("[Client AI Match] Found client-side Gemini API Key. Running browser-side matching...");
+      const ai = new GoogleGenAI({
+        apiKey: clientApiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          }
+        }
+      });
+
+      // Match exact ones first locally to save tokens & latency
+      const mappings: Array<{ target: string; golden: string | null; matchType: "exact" | "ai" | "unmatched" }> = [];
+      const unmatchedTargets: string[] = [];
+
+      for (const target of uploaded) {
+        const normTarget = normalizeHeader(target);
+        const exactMatch = golden.find(g => normalizeHeader(g) === normTarget);
+        if (exactMatch) {
+          mappings.push({ target, golden: exactMatch, matchType: "exact" });
+        } else {
+          unmatchedTargets.push(target);
+        }
+      }
+
+      if (unmatchedTargets.length > 0) {
+        const prompt = `
+You are an Excel spreadsheet column-matching assistant.
+We have a master list of "golden" column headers (desired template schema):
+${JSON.stringify(golden)}
+
+We have some uploaded columns that do not have direct exact matches. Find the single closest semantic match for each from our golden list:
+${JSON.stringify(unmatchedTargets)}
+
+Rules:
+1. Align the uploaded target headers to the golden list of headers.
+2. Only match if there is a strong semantic similarity (e.g., "Regulatory Approvals" maps to "Regulatory", "Warranty period" maps to "Warranty", "Sync in" maps to "Sync Input", "Stand" maps to "Foot", "Speaker" maps to "Built-in Speakers").
+3. If an uploaded column has absolutely no relation or representation in the golden columns list, map it to empty string "".
+        `.trim();
+
+        const apiCall = ai.models.generateContent({
+          model: "gemini-3.5-flash",
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                mappings: {
+                  type: Type.ARRAY,
+                  description: "List of matched column pairs",
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      target: { type: Type.STRING, description: "The original unmatched target header" },
+                      golden: { type: Type.STRING, description: "The semantically matched golden header from the golden list, or empty string if no reasonable semantic match exists" }
+                    },
+                    required: ["target", "golden"]
+                  }
+                }
+              },
+              required: ["mappings"]
+            }
+          }
+        });
+
+        // Race client-side call against 30s timeout
+        const timeoutPromise = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("Client Gemini API call timed out (30s)")), 30000)
+        );
+
+        const response = await Promise.race([apiCall, timeoutPromise]);
+        const resText = response?.text || "{}";
+        const aiResult = JSON.parse(resText) as {
+          mappings?: Array<{ target: string; golden: string }>;
+        };
+
+        if (aiResult.mappings && Array.isArray(aiResult.mappings)) {
+          for (const item of aiResult.mappings) {
+            const matchedGolden = item.golden && item.golden.trim() !== "" && golden.includes(item.golden) ? item.golden : null;
+            mappings.push({
+              target: item.target,
+              golden: matchedGolden,
+              matchType: matchedGolden ? "ai" : "unmatched"
+            });
+          }
+        }
+      }
+
+      // Ensure all unmatched targets are mapped
+      const mappedTargets = new Set(mappings.map(m => m.target));
+      const remainingTargets = unmatchedTargets.filter(t => !mappedTargets.has(t));
+      for (const target of remainingTargets) {
+        mappings.push({
+          target,
+          golden: null,
+          matchType: "unmatched"
+        });
+      }
+
+      const newMappings: { [key: string]: string | null } = {};
+      const newSources: { [key: string]: "exact" | "ai" | "unmatched" | "manual" } = {};
+      for (const item of mappings) {
+        newMappings[item.target] = item.golden;
+        newSources[item.target] = item.matchType;
+      }
+
+      setColumnMappings(newMappings);
+      setMappingSource(newSources);
+      showSuccess(`欄位自動語意分析完成 (Client AI)！已為 ${uploaded.length} 個欄位找到最佳對應。`);
+      return true;
+    } catch (clientAiErr) {
+      console.error("[Client AI Match] Client-side Gemini matching failed:", clientAiErr);
+      return false;
+    }
+  };
+
   // Run Column Alignment Matching via Server-side API or Client similarity fallback
   const runAlignmentMapping = async (uploaded: string[], golden: string[]) => {
     setIsLoadingMapping(true);
@@ -282,18 +408,29 @@ export default function App() {
         setMappingSource(newSources);
         showSuccess(`欄位自動分析完成！已為 ${uploaded.length} 個欄位找到最佳對應。`);
       } else {
-        console.warn("AI mapping was unsuccessful, popping fallback decision modal to user.");
-        // AI was unsuccessful/unavailable, but we might have exact matches. Store partials and ask.
-        setPendingUploaded(uploaded);
-        setPendingGolden(golden);
-        setPartialMappings(newMappings);
-        setPartialSources(newSources);
-        setShowFallbackModal(true);
+        console.warn("Server AI mapping was unsuccessful, trying client-side AI mapping fallback.");
+        const clientAiSuccess = await runClientSideSemanticMapping(uploaded, golden);
+        if (!clientAiSuccess) {
+          console.warn("Client-side AI mapping was also unsuccessful, popping local decision modal to user.");
+          // AI was unsuccessful/unavailable, but we might have exact matches. Store partials and ask.
+          setPendingUploaded(uploaded);
+          setPendingGolden(golden);
+          setPartialMappings(newMappings);
+          setPartialSources(newSources);
+          setShowFallbackModal(true);
+        }
       }
 
     } catch (apiErr) {
-      console.warn("API completely failed, prompting for client-side local fallback:", apiErr);
+      console.warn("Server API completely failed, trying client-side AI matching fallback first:", apiErr);
       
+      const clientAiSuccess = await runClientSideSemanticMapping(uploaded, golden);
+      if (clientAiSuccess) {
+        setIsLoadingMapping(false);
+        return; // Client AI worked, no need for fuzzy Levenshtein modal
+      }
+
+      // Client AI also failed/unavailable, fallback to Levenshtein option modal
       const newMappings: { [key: string]: string | null } = {};
       const newSources: { [key: string]: "exact" | "ai" | "unmatched" | "manual" } = {};
 
